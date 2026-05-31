@@ -1,0 +1,68 @@
+name: Preview Release
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-release:
+    name: Build and Release Preview
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      run: rustup toolchain install stable
+
+
+    - name: Cache cargo registry and build output
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Check build
+      run: cargo check --verbose
+
+    - name: Build project
+      run: cargo build --verbose
+
+    - name: Extract version from Cargo.toml
+      id: extract_version
+      run: |
+        VERSION=$(grep '^version' Cargo.toml | cut -d '=' -f 2 | tr -d ' "')
+        echo "Extracted version: $VERSION"
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Generate preview version
+      id: generate_preview_version
+      run: |
+        TIMESTAMP=$(date +%Y%m%d%H%M%S)
+        BASE_VERSION=${{ steps.extract_version.outputs.version }}
+        PREVIEW_VERSION="${BASE_VERSION}-preview-${TIMESTAMP}"
+        echo "Generated preview version: $PREVIEW_VERSION"
+        echo "preview_version=$PREVIEW_VERSION" >> $GITHUB_OUTPUT
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v3
+      if: github.ref == 'refs/heads/main'
+      with:
+        tag_name: ${{ steps.generate_preview_version.outputs.preview_version }}
+        name: Preview Release ${{ steps.generate_preview_version.outputs.preview_version }}
+        body: |
+          Automatic preview release generated from commit ${{ github.sha }}
+          Base version: ${{ steps.extract_version.outputs.version }}
+        draft: false
+        prerelease: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
