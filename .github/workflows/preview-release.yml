@@ -59,6 +59,9 @@ jobs:
         echo "Generated preview version: $PREVIEW_VERSION"
         echo "preview_version=$PREVIEW_VERSION" >> $GITHUB_OUTPUT
 
+    - name: Build release artifacts
+      run: cargo build --release
+
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v3
       if: github.ref == 'refs/heads/main'
@@ -70,6 +73,9 @@ jobs:
           Base version: ${{ steps.extract_version.outputs.version }}
         draft: false
         prerelease: true
+        files: |
+            target/release/mistral-srt-ai-gen
+        
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
