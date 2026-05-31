@@ -60,8 +60,11 @@ jobs:
             clang \
             pkg-config \
             libavcodec-dev \
+            libavdevice-dev \
+            libavfilter-dev \
             libavformat-dev \
             libavutil-dev \
+            libpostproc-dev \
             libswresample-dev \
             libswscale-dev
 
@@ -151,8 +154,11 @@ jobs:
             clang \
             pkg-config \
             libavcodec-dev \
+            libavdevice-dev \
+            libavfilter-dev \
             libavformat-dev \
             libavutil-dev \
+            libpostproc-dev \
             libswresample-dev \
             libswscale-dev
 
