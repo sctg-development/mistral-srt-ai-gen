@@ -44,6 +44,12 @@ jobs:
         echo "Extracted version: $VERSION"
         echo "version=$VERSION" >> $GITHUB_OUTPUT
 
+    - name: Install Tarpaulin for code coverage
+      run: cargo install cargo-tarpaulin
+
+    - name: Run tests with coverage
+      run: API_KEY=${{ secrets.API_KEY }}   cargo tarpaulin --out Xml --output-dir .
+
     - name: Generate preview version
       id: generate_preview_version
       run: |
@@ -66,3 +72,10 @@ jobs:
         prerelease: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v5
+      with:
+          files: ./rust/cobertura.xml
+          slug: sctg-development/mistral-srt-ai-gen
+          token: ${{ secrets.CODECOV_TOKEN }}
