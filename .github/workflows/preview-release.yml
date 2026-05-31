@@ -35,11 +35,11 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact: mistral-srt-ai-gen-ubuntu-arm64
           - platform: macos-x64
-            runner: macos-14
+            runner: macos-13
             target: x86_64-apple-darwin
             artifact: mistral-srt-ai-gen-macos-x64
           - platform: macos-arm64
-            runner: macos-14-arm64
+            runner: macos-14
             target: aarch64-apple-darwin
             artifact: mistral-srt-ai-gen-macos-arm64
     steps:
