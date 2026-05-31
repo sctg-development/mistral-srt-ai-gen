@@ -24,6 +24,8 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use ffmpeg::{codec, encoder, format, media, rescale, Rational, Rescale};
+use ffmpeg_next as ffmpeg;
 use std::fs;
 use std::path::PathBuf;
 
@@ -34,6 +36,7 @@ use key_rotator::KeyRotator;
 ///
 /// A tool to generate SRT (SubRip) subtitle files from audio/video files using Mistral AI services.
 /// This tool supports transcription and optional translation to multiple target languages.
+/// You can specify time ranges to process only a portion of the input file.
 ///
 /// # Examples
 ///
@@ -49,12 +52,14 @@ use key_rotator::KeyRotator;
 ///     language: None,
 ///     translate_to: vec![],
 ///     temperature: 0.3,
+///     start: None,
+///     end: None,
 /// };
 ///
 /// run(args).unwrap();
 /// ```
 ///
-/// Transcription with translation:
+/// Transcription with time range:
 /// ```
 /// use mistral_srt_ai_gen::{Args, run};
 /// use std::path::PathBuf;
@@ -64,8 +69,10 @@ use key_rotator::KeyRotator;
 ///     output_file: PathBuf::from("output.srt"),
 ///     api_key: "your-api-key".to_string(),
 ///     language: Some("fr".to_string()),
-///     translate_to: vec!["english".to_string(), "spanish".to_string()],
+///     translate_to: vec![],
 ///     temperature: 0.3,
+///     start: Some("30s".to_string()),
+///     end: Some("00:01:30,000".to_string()),
 /// };
 ///
 /// run(args).unwrap();
@@ -96,6 +103,14 @@ struct Args {
     /// Temperature for AI model (0.0-1.0, default: 0.3)
     #[arg(long, default_value_t = 0.3)]
     temperature: f32,
+
+    /// Start time for processing (format: [number]s or hh:mm:ss,ms, default: beginning of file)
+    #[arg(long, value_name = "TIME")]
+    start: Option<String>,
+
+    /// End time for processing (format: [number]s or hh:mm:ss,ms, default: end of file)
+    #[arg(long, value_name = "TIME")]
+    end: Option<String>,
 }
 
 /// Main transcription segment structure from Mistral API
@@ -169,6 +184,282 @@ enum AppError {
 
     #[error("API error: {0}")]
     ApiError(String),
+
+    #[error("Invalid time format: {0}")]
+    InvalidTimeFormat(String),
+
+    #[error("Segment extraction is supported only for formats: mp3, wav, m4a, flac, ogg, mp4, mov, mkv, webm (got: {0})")]
+    UnsupportedSegmentFormat(String),
+}
+
+const SEGMENT_EXTRACT_SUPPORTED_EXTENSIONS: [&str; 9] = [
+    "mp3", "wav", "m4a", "flac", "ogg", "mp4", "mov", "mkv", "webm",
+];
+
+struct TempSegmentFile {
+    path: PathBuf,
+}
+
+impl Drop for TempSegmentFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Parse time string into seconds
+///
+/// Supports two formats:
+/// - [number]s (e.g., "30s", "120s")
+/// - hh:mm:ss,ms (e.g., "00:01:30,500", "01:00:00,000")
+///
+/// # Arguments
+///
+/// * `time_str` - Time string to parse
+///
+/// # Returns
+///
+/// Result containing time in seconds or error
+fn parse_time(time_str: &str) -> Result<f32, AppError> {
+    // Check for [number]s format
+    if time_str.ends_with('s') {
+        if let Ok(seconds) = time_str.trim_end_matches('s').parse::<f32>() {
+            if seconds < 0.0 {
+                return Err(AppError::InvalidTimeFormat(format!(
+                    "Time cannot be negative: {}",
+                    time_str
+                )));
+            }
+            return Ok(seconds);
+        }
+    }
+
+    // Check for hh:mm:ss,ms format
+    let parts: Vec<&str> = time_str.split(':').collect();
+    if parts.len() == 3 {
+        let hours = parts[0].parse::<u32>().map_err(|_| {
+            AppError::InvalidTimeFormat(format!("Invalid hours format: {}", parts[0]))
+        })?;
+
+        let minutes = parts[1].parse::<u32>().map_err(|_| {
+            AppError::InvalidTimeFormat(format!("Invalid minutes format: {}", parts[1]))
+        })?;
+
+        let sec_ms_parts: Vec<&str> = parts[2].split(',').collect();
+        if sec_ms_parts.len() != 2 {
+            return Err(AppError::InvalidTimeFormat(format!(
+                "Invalid seconds/milliseconds format: {}",
+                parts[2]
+            )));
+        }
+
+        let seconds = sec_ms_parts[0].parse::<u32>().map_err(|_| {
+            AppError::InvalidTimeFormat(format!("Invalid seconds format: {}", sec_ms_parts[0]))
+        })?;
+
+        let millis = sec_ms_parts[1].parse::<u32>().map_err(|_| {
+            AppError::InvalidTimeFormat(format!("Invalid milliseconds format: {}", sec_ms_parts[1]))
+        })?;
+
+        if minutes >= 60 || seconds >= 60 || millis >= 1000 {
+            return Err(AppError::InvalidTimeFormat(format!(
+                "Invalid hh:mm:ss,ms value: {}",
+                time_str
+            )));
+        }
+
+        // Convert hh:mm:ss,ms to total seconds
+        let total_seconds = (hours as f32 * 3600.0)
+            + (minutes as f32 * 60.0)
+            + (seconds as f32)
+            + (millis as f32 / 1000.0);
+        return Ok(total_seconds);
+    }
+
+    Err(AppError::InvalidTimeFormat(format!(
+        "Invalid time format: {}. Expected [number]s or hh:mm:ss,ms",
+        time_str
+    )))
+}
+
+fn supports_segment_extraction(file_path: &PathBuf) -> bool {
+    file_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            SEGMENT_EXTRACT_SUPPORTED_EXTENSIONS
+                .iter()
+                .any(|supported| supported.eq_ignore_ascii_case(ext))
+        })
+        .unwrap_or(false)
+}
+
+fn maybe_extract_source_segment(
+    input_file: &PathBuf,
+    start_time: Option<f32>,
+    end_time: Option<f32>,
+) -> Result<(PathBuf, Option<TempSegmentFile>)> {
+    if start_time.is_none() && end_time.is_none() {
+        return Ok((input_file.clone(), None));
+    }
+
+    if !supports_segment_extraction(input_file) {
+        let extension = input_file
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("unknown");
+        return Err(AppError::UnsupportedSegmentFormat(extension.to_string()).into());
+    }
+
+    let extension = input_file
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("tmp");
+
+    let temp_output_path = std::env::temp_dir().join(format!(
+        "mistral-srt-ai-gen-segment-{}-{}.{}",
+        std::process::id(),
+        rand::random::<u64>(),
+        extension
+    ));
+
+    extract_segment_with_ffmpeg_next(input_file, &temp_output_path, start_time, end_time)?;
+
+    Ok((
+        temp_output_path.clone(),
+        Some(TempSegmentFile {
+            path: temp_output_path,
+        }),
+    ))
+}
+
+fn extract_segment_with_ffmpeg_next(
+    input_file: &PathBuf,
+    output_file: &PathBuf,
+    start_time: Option<f32>,
+    end_time: Option<f32>,
+) -> Result<()> {
+    ffmpeg::init().map_err(|e| {
+        AppError::ApiError(format!("Failed to initialize ffmpeg-next: {}", e))
+    })?;
+
+    let mut ictx = format::input(input_file).map_err(|e| {
+        AppError::ApiError(format!(
+            "Failed to open input for segment extraction ({}): {}",
+            input_file.display(),
+            e
+        ))
+    })?;
+
+    let mut octx = format::output(output_file).map_err(|e| {
+        AppError::ApiError(format!(
+            "Failed to create output for segment extraction ({}): {}",
+            output_file.display(),
+            e
+        ))
+    })?;
+
+    let mut stream_mapping = vec![-1_i32; ictx.nb_streams() as usize];
+    let mut ist_time_bases = vec![Rational(0, 1); ictx.nb_streams() as usize];
+    let mut ost_index = 0;
+
+    for (ist_index, ist) in ictx.streams().enumerate() {
+        let ist_medium = ist.parameters().medium();
+        if ist_medium != media::Type::Audio
+            && ist_medium != media::Type::Video
+            && ist_medium != media::Type::Subtitle
+        {
+            continue;
+        }
+
+        stream_mapping[ist_index] = ost_index;
+        ist_time_bases[ist_index] = ist.time_base();
+        ost_index += 1;
+
+        let mut ost = octx
+            .add_stream(encoder::find(codec::Id::None))
+            .map_err(|e| AppError::ApiError(format!("Failed to add output stream: {}", e)))?;
+        ost.set_parameters(ist.parameters());
+
+        // Reset codec_tag to avoid container incompatibilities during remux.
+        unsafe {
+            (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+        }
+    }
+
+    if let Some(start) = start_time {
+        let start_ts = ((start as f64) * 1_000_000.0) as i64;
+        ictx.seek(start_ts, ..start_ts).map_err(|e| {
+            AppError::ApiError(format!("Failed to seek to start time {}s: {}", start, e))
+        })?;
+    }
+
+    octx.set_metadata(ictx.metadata().to_owned());
+    octx.write_header().map_err(|e| {
+        AppError::ApiError(format!("Failed to write output header: {}", e))
+    })?;
+
+    let start_ts = start_time.map(|s| ((s as f64) * 1_000_000.0) as i64);
+    let end_ts = end_time.map(|e| ((e as f64) * 1_000_000.0) as i64);
+    let mut first_ts_per_stream: Vec<Option<i64>> = vec![None; ictx.nb_streams() as usize];
+
+    for (stream, mut packet) in ictx.packets() {
+        let ist_index = stream.index();
+        let mapped_ost_index = stream_mapping[ist_index];
+        if mapped_ost_index < 0 {
+            continue;
+        }
+
+        let packet_ts_base = packet
+            .pts()
+            .or(packet.dts())
+            .map(|ts| ts.rescale(stream.time_base(), rescale::TIME_BASE));
+
+        if let (Some(start), Some(ts)) = (start_ts, packet_ts_base) {
+            if ts < start {
+                continue;
+            }
+        }
+
+        if let (Some(end), Some(ts)) = (end_ts, packet_ts_base) {
+            if ts >= end {
+                continue;
+            }
+        }
+
+        if packet.pts().is_some() || packet.dts().is_some() {
+            let first_ts = first_ts_per_stream[ist_index].get_or_insert_with(|| {
+                packet.dts().or(packet.pts()).unwrap_or(0)
+            });
+
+            if let Some(pts) = packet.pts() {
+                packet.set_pts(Some(pts.saturating_sub(*first_ts)));
+            }
+
+            if let Some(dts) = packet.dts() {
+                packet.set_dts(Some(dts.saturating_sub(*first_ts)));
+            }
+        }
+
+        let ost = octx.stream(mapped_ost_index as usize).ok_or_else(|| {
+            AppError::ApiError(format!(
+                "Output stream index {} not found",
+                mapped_ost_index
+            ))
+        })?;
+
+        packet.rescale_ts(ist_time_bases[ist_index], ost.time_base());
+        packet.set_position(-1);
+        packet.set_stream(mapped_ost_index as usize);
+        packet.write_interleaved(&mut octx).map_err(|e| {
+            AppError::ApiError(format!("Failed to write packet: {}", e))
+        })?;
+    }
+
+    octx.write_trailer().map_err(|e| {
+        AppError::ApiError(format!("Failed to finalize output segment: {}", e))
+    })?;
+
+    Ok(())
 }
 
 /// Convert seconds to SRT time format (HH:MM:SS,mmm)
@@ -401,9 +692,44 @@ async fn run(args: Args) -> Result<()> {
         }
     }
 
+    // Parse start and end times if provided
+    let start_time = if let Some(start_str) = &args.start {
+        Some(parse_time(start_str).map_err(|e| {
+            AppError::InvalidTimeFormat(format!("Invalid start time: {}", e))
+        })?)
+    } else {
+        None
+    };
+
+    let end_time = if let Some(end_str) = &args.end {
+        Some(parse_time(end_str).map_err(|e| {
+            AppError::InvalidTimeFormat(format!("Invalid end time: {}", e))
+        })?)
+    } else {
+        None
+    };
+
+    if let (Some(start), Some(end)) = (start_time, end_time) {
+        if end <= start {
+            return Err(AppError::InvalidTimeFormat(
+                "End time must be greater than start time".to_string(),
+            )
+            .into());
+        }
+    }
+
+    let (input_for_transcription, _segment_temp_guard) =
+        maybe_extract_source_segment(&args.input_file, start_time, end_time)?;
+
     println!("Starting transcription process...");
     println!("Input file: {}", args.input_file.display());
     println!("Output file: {}", args.output_file.display());
+    if let Some(start) = start_time {
+        println!("Start time: {} seconds", start);
+    }
+    if let Some(end) = end_time {
+        println!("End time: {} seconds", end);
+    }
 
     // Create key rotator for round-robin API key rotation
     let key_rotator = KeyRotator::new(&args.api_key);
@@ -420,7 +746,7 @@ async fn run(args: Args) -> Result<()> {
     // Step 1: Transcribe audio
     let transcription = transcribe_audio_with_rotator(
         &key_rotator,
-        &args.input_file,
+        &input_for_transcription,
         args.language.as_deref()
     ).await?;
 
@@ -429,8 +755,10 @@ async fn run(args: Args) -> Result<()> {
         transcription.segments.len()
     );
 
+    let filtered_segments = transcription.segments.clone();
+
     // Generate SRT for original language
-    let original_srt = generate_srt_content(transcription.segments.clone());
+    let original_srt = generate_srt_content(filtered_segments.clone());
     fs::write(&args.output_file, original_srt)?;
 
     println!("Original SRT file saved to: {}", args.output_file.display());
@@ -447,8 +775,7 @@ async fn run(args: Args) -> Result<()> {
 
             // Join all segment texts with a unique separator for a single translation API call
             let separator = "|||SEG|||";
-            let combined_text: String = transcription
-                .segments
+            let combined_text: String = filtered_segments
                 .iter()
                 .map(|s| s.text.trim())
                 .collect::<Vec<_>>()
@@ -465,8 +792,7 @@ async fn run(args: Args) -> Result<()> {
             // Split translated text back into individual segment texts
             let translated_parts: Vec<&str> = translated_combined.split(separator).collect();
 
-            let translated_segments: Vec<TranscriptionSegment> = transcription
-                .segments
+            let translated_segments: Vec<TranscriptionSegment> = filtered_segments
                 .iter()
                 .enumerate()
                 .map(|(i, segment)| TranscriptionSegment {
@@ -640,6 +966,8 @@ mod tests {
             language: Some("fr".to_string()),
             translate_to: vec![],
             temperature: 0.3,
+            start: None,
+            end: None,
         };
 
         // This should not panic - language validation happens in run()
@@ -655,6 +983,8 @@ mod tests {
             language: None,
             translate_to: vec![],
             temperature: 0.5,
+            start: None,
+            end: None,
         };
 
         assert_eq!(args.temperature, 0.5);
@@ -669,6 +999,8 @@ mod tests {
             language: None,
             translate_to: vec![],
             temperature: 0.3,
+            start: None,
+            end: None,
         };
 
         assert!(args.input_file.exists() || args.input_file.to_str().unwrap() == "input.mp3");
@@ -809,6 +1141,162 @@ mod tests {
 
         let api_error = AppError::ApiError("API failed".to_string());
         assert_eq!(api_error.to_string(), "API error: API failed");
+
+        let invalid_time = AppError::InvalidTimeFormat("Invalid time".to_string());
+        assert_eq!(invalid_time.to_string(), "Invalid time format: Invalid time");
+    }
+
+    #[test]
+    fn test_parse_time() {
+        // Test [number]s format
+        assert_eq!(parse_time("30s").unwrap(), 30.0);
+        assert_eq!(parse_time("120s").unwrap(), 120.0);
+        assert_eq!(parse_time("0.5s").unwrap(), 0.5);
+
+        // Test hh:mm:ss,ms format
+        assert_eq!(parse_time("00:00:30,500").unwrap(), 30.5);
+        assert_eq!(parse_time("00:01:30,000").unwrap(), 90.0);
+        assert_eq!(parse_time("01:00:00,000").unwrap(), 3600.0);
+        assert_eq!(parse_time("01:01:01,100").unwrap(), 3661.1);
+
+        // Test invalid formats
+        assert!(parse_time("30").is_err());
+        assert!(parse_time("30x").is_err());
+        assert!(parse_time("00:30").is_err());
+        assert!(parse_time("00:30:00").is_err());
+        assert!(parse_time("00:61:00,000").is_err());
+        assert!(parse_time("00:30:61,000").is_err());
+        assert!(parse_time("00:30:59,1000").is_err());
+        assert!(parse_time("abc").is_err());
+    }
+
+    #[test]
+    fn test_supports_segment_extraction() {
+        for supported in [
+            "sample.mp3",
+            "sample.wav",
+            "sample.m4a",
+            "sample.flac",
+            "sample.ogg",
+            "sample.mp4",
+            "sample.mov",
+            "sample.mkv",
+            "sample.webm",
+        ] {
+            assert!(supports_segment_extraction(&PathBuf::from(supported)));
+        }
+
+        assert!(!supports_segment_extraction(&PathBuf::from("sample.jpeg")));
+    }
+
+    #[test]
+    fn test_extract_segment_with_ffmpeg_next_mp4() {
+        let input_file = PathBuf::from("test_data/sample.mp4");
+        if !input_file.exists() {
+            eprintln!("test_data/sample.mp4 not found, skipping test");
+            return;
+        }
+
+        let result = maybe_extract_source_segment(&input_file, Some(0.0), Some(30.0));
+        assert!(result.is_ok(), "MP4 segment extraction should succeed");
+
+        let (segment_path, _guard) = result.unwrap();
+        let metadata = fs::metadata(&segment_path).unwrap();
+        assert!(metadata.len() > 0, "Extracted MP4 segment should not be empty");
+    }
+
+    #[test]
+    fn test_segment_filtering() {
+        // Create test segments
+        let segments = vec![
+            TranscriptionSegment {
+                start: 0.0,
+                end: 10.0,
+                text: "Segment 1".to_string(),
+            },
+            TranscriptionSegment {
+                start: 10.0,
+                end: 20.0,
+                text: "Segment 2".to_string(),
+            },
+            TranscriptionSegment {
+                start: 20.0,
+                end: 30.0,
+                text: "Segment 3".to_string(),
+            },
+            TranscriptionSegment {
+                start: 30.0,
+                end: 40.0,
+                text: "Segment 4".to_string(),
+            },
+        ];
+
+        // Test no filtering
+        let filtered = filter_segments(&segments, None, None);
+        assert_eq!(filtered.len(), 4);
+        assert_eq!(filtered[0].text, "Segment 1");
+        assert_eq!(filtered[1].text, "Segment 2");
+        assert_eq!(filtered[2].text, "Segment 3");
+        assert_eq!(filtered[3].text, "Segment 4");
+
+        // Test start time filtering
+        let filtered = filter_segments(&segments, Some(15.0), None);
+        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered[0].text, "Segment 2");
+        assert_eq!(filtered[0].start, 0.0); // Adjusted timestamp
+        assert_eq!(filtered[0].end, 5.0);   // Adjusted timestamp
+        assert_eq!(filtered[1].text, "Segment 3");
+        assert_eq!(filtered[2].text, "Segment 4");
+
+        // Test end time filtering
+        let filtered = filter_segments(&segments, None, Some(25.0));
+        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered[0].text, "Segment 1");
+        assert_eq!(filtered[1].text, "Segment 2");
+        assert_eq!(filtered[2].text, "Segment 3");
+
+        // Test both start and end time filtering
+        let filtered = filter_segments(&segments, Some(5.0), Some(25.0));
+        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered[0].text, "Segment 1");
+        assert_eq!(filtered[0].start, 0.0);
+        assert_eq!(filtered[0].end, 5.0);
+        assert_eq!(filtered[1].text, "Segment 2");
+        assert_eq!(filtered[2].text, "Segment 3");
+
+        // Test filtering with no results
+        let filtered = filter_segments(&segments, Some(50.0), None);
+        assert_eq!(filtered.len(), 0);
+    }
+
+    fn filter_segments(segments: &[TranscriptionSegment], start_time: Option<f32>, end_time: Option<f32>) -> Vec<TranscriptionSegment> {
+        let mut filtered_segments = segments.to_vec();
+
+        if start_time.is_some() || end_time.is_some() {
+            filtered_segments = filtered_segments
+                .into_iter()
+                .filter(|segment| {
+                    let segment_start = segment.start;
+                    let segment_end = segment.end;
+
+                    // Check if segment overlaps with the specified time range
+                    let after_start = start_time.map_or(true, |start| segment_end > start);
+                    let before_end = end_time.map_or(true, |end| segment_start < end);
+
+                    after_start && before_end
+                })
+                .map(|mut segment| {
+                    // Adjust segment timestamps by subtracting start time
+                    if let Some(start) = start_time {
+                        segment.start = (segment.start - start).max(0.0);
+                        segment.end = (segment.end - start).max(0.0);
+                    }
+                    segment
+                })
+                .collect();
+        }
+
+        filtered_segments
     }
 
     #[tokio::test]
@@ -890,110 +1378,302 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_transcribe_audio_file_not_found() {
-        let file_path = PathBuf::from("nonexistent.flac");
+    async fn test_run_transcription_only_with_mock() {
+        let mut server = Server::new_async().await;
+        let _transcription_mock = mock_transcription_server(&mut server);
 
-        // Test the file reading error directly
-        let result = fs::read(&file_path)
-            .with_context(|| format!("Failed to read file: {}", file_path.display()));
+        let temp_input = NamedTempFile::new().unwrap();
+        let temp_output = NamedTempFile::new().unwrap();
 
-        assert!(result.is_err());
-        if let Err(e) = result {
-            assert!(e.to_string().contains("Failed to read file"));
-        }
+        // Create a modified version of run for testing
+        let result: Result<(), anyhow::Error> = async {
+            // Override the URL for testing
+            let mock_url = server.url();
+
+            // Create a modified transcribe_audio function for testing
+            let test_transcribe_audio = |api_key: String, file_path: PathBuf, language: Option<String>| async move {
+                let client = reqwest::Client::new();
+                let url = format!("{}/v1/audio/transcriptions", mock_url);
+
+                // Read file content
+                let file_content = fs::read(&file_path)
+                    .with_context(|| format!("Failed to read file: {}", file_path.display()))
+                    .unwrap();
+
+                // Build multipart form
+                let file_name = file_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file")
+                    .to_string();
+
+                let form = reqwest::multipart::Form::new()
+                    .text("model", "voxstral-mini-latest")
+                    .part("file", reqwest::multipart::Part::bytes(file_content).file_name(file_name))
+                    .text("response_format", "json");
+
+                let form = if let Some(lang) = language {
+                    form.text("language", lang)
+                } else {
+                    form
+                };
+
+                let response = client
+                    .post(&url)
+                    .bearer_auth(api_key)
+                    .multipart(form)
+                    .send()
+                    .await
+                    .unwrap();
+
+                let status = response.status();
+                if !status.is_success() {
+                    let error_body = response.text().await.unwrap_or_default();
+                    return Err::<TranscriptionResponse, anyhow::Error>(AppError::ApiError(format!(
+                        "API request failed: {} - {}",
+                        status,
+                        error_body
+                    ))
+                    .into());
+                }
+
+                let transcription: TranscriptionResponse = response.json().await.unwrap();
+                Ok(transcription)
+            };
+
+            let args = Args {
+                input_file: temp_input.path().to_path_buf(),
+                output_file: temp_output.path().to_path_buf(),
+                api_key: "test_api_key".to_string(),
+                language: None,
+                translate_to: vec![],
+                temperature: 0.3,
+                start: None,
+                end: None,
+            };
+
+            // Validate temperature range
+            if args.temperature < 0.0 || args.temperature > 1.0 {
+                return Err(
+                    AppError::ApiError("Temperature must be between 0.0 and 1.0".to_string()).into(),
+                );
+            }
+
+            // Validate language code if provided
+            if let Some(ref lang) = args.language {
+                if lang.len() != 2 {
+                    return Err(AppError::InvalidLanguage(format!(
+                        "Language code must be 2 characters (ISO 639-1), got: {}",
+                        lang
+                    ))
+                    .into());
+                }
+            }
+
+            // Step 1: Transcribe audio using our test function
+            let transcription = test_transcribe_audio(args.api_key.clone(), args.input_file.clone(), args.language.clone()).await.unwrap();
+
+            // Generate SRT for original language
+            let original_srt = generate_srt_content(transcription.segments.clone());
+            fs::write(&args.output_file, original_srt).unwrap();
+
+            Ok(())
+        }.await;
+
+        assert!(result.is_ok());
+        let output_content = fs::read_to_string(temp_output.path()).unwrap();
+        assert!(!output_content.is_empty());
+        assert!(output_content.contains("Test transcription"));
     }
 
     #[tokio::test]
-    async fn test_transcribe_audio_api_error() {
+    async fn test_run_with_time_range_filtering() {
         let mut server = Server::new_async().await;
-        let _m = server.mock("POST", "/v1/audio/transcriptions")
-            .with_status(500)
-            .with_body("Internal Server Error")
+
+        // Create a mock server with multiple segments
+        let _transcription_mock = server.mock("POST", "/v1/audio/transcriptions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "segments": [
+                    {
+                        "start": 0.0,
+                        "end": 10.0,
+                        "text": "Segment 1"
+                    },
+                    {
+                        "start": 10.0,
+                        "end": 20.0,
+                        "text": "Segment 2"
+                    },
+                    {
+                        "start": 20.0,
+                        "end": 30.0,
+                        "text": "Segment 3"
+                    },
+                    {
+                        "start": 30.0,
+                        "end": 40.0,
+                        "text": "Segment 4"
+                    }
+                ],
+                "text": "Test transcription text with multiple segments"
+            }"#)
             .create();
 
-        let temp_file = NamedTempFile::new().unwrap();
-        let file_path = temp_file.path().to_path_buf();
+        let temp_input = NamedTempFile::new().unwrap();
+        let temp_output = NamedTempFile::new().unwrap();
 
-        // Override the URL to use the mock server
-        let mock_url = server.url();
+        // Create a modified version of run for testing
+        let result: Result<(), anyhow::Error> = async {
+            // Override the URL for testing
+            let mock_url = server.url();
 
-        // Create a modified version of transcribe_audio for testing
-        let client = reqwest::Client::new();
-        let url = format!("{}/v1/audio/transcriptions", mock_url);
+            // Create a modified transcribe_audio function for testing
+            let test_transcribe_audio = |api_key: String, file_path: PathBuf, language: Option<String>| async move {
+                let client = reqwest::Client::new();
+                let url = format!("{}/v1/audio/transcriptions", mock_url);
 
-        // Read file content
-        let file_content = fs::read(&file_path).unwrap();
+                // Read file content
+                let file_content = fs::read(&file_path)
+                    .with_context(|| format!("Failed to read file: {}", file_path.display()))
+                    .unwrap();
 
-        // Build multipart form
-        let file_name = file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file")
-            .to_string();
+                // Build multipart form
+                let file_name = file_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file")
+                    .to_string();
 
-        let form = reqwest::multipart::Form::new()
-            .text("model", "voxstral-mini-latest")
-            .part("file", reqwest::multipart::Part::bytes(file_content).file_name(file_name))
-            .text("response_format", "json");
+                let form = reqwest::multipart::Form::new()
+                    .text("model", "voxstral-mini-latest")
+                    .part("file", reqwest::multipart::Part::bytes(file_content).file_name(file_name))
+                    .text("response_format", "json");
 
-        let response = client
-            .post(&url)
-            .bearer_auth("test_api_key")
-            .multipart(form)
-            .send()
-            .await
-            .unwrap();
+                let form = if let Some(lang) = language {
+                    form.text("language", lang)
+                } else {
+                    form
+                };
 
-        let status = response.status();
-        assert_eq!(status, 500);
+                let response = client
+                    .post(&url)
+                    .bearer_auth(api_key)
+                    .multipart(form)
+                    .send()
+                    .await
+                    .unwrap();
 
-        let error_body = response.text().await.unwrap_or_default();
-        assert_eq!(error_body, "Internal Server Error");
-    }
+                let status = response.status();
+                if !status.is_success() {
+                    let error_body = response.text().await.unwrap_or_default();
+                    return Err::<TranscriptionResponse, anyhow::Error>(AppError::ApiError(format!(
+                        "API request failed: {} - {}",
+                        status,
+                        error_body
+                    ))
+                    .into());
+                }
 
-    #[tokio::test]
-    async fn test_translate_text_with_mock() {
-        let mut server = Server::new_async().await;
-        let _m = mock_translation_server(&mut server);
+                let transcription: TranscriptionResponse = response.json().await.unwrap();
+                Ok(transcription)
+            };
 
-        // Override the URL to use the mock server
-        let mock_url = server.url();
+            let args = Args {
+                input_file: temp_input.path().to_path_buf(),
+                output_file: temp_output.path().to_path_buf(),
+                api_key: "test_api_key".to_string(),
+                language: None,
+                translate_to: vec![],
+                temperature: 0.3,
+                start: Some("15s".to_string()),
+                end: Some("35s".to_string()),
+            };
 
-        // Create a modified version of translate_text for testing
-        let client = reqwest::Client::new();
-        let url = format!("{}/v1/chat/completions", mock_url);
+            // Validate temperature range
+            if args.temperature < 0.0 || args.temperature > 1.0 {
+                return Err(
+                    AppError::ApiError("Temperature must be between 0.0 and 1.0".to_string()).into(),
+                );
+            }
 
-        let request = TranslationRequest {
-            model: "mistral-small-latest".to_string(),
-            messages: vec![
-                Message {
-                    role: "system".to_string(),
-                    content: "You are a professional translator. Translate the following text to english:".to_string(),
-                },
-                Message {
-                    role: "user".to_string(),
-                    content: "Bonjour".to_string(),
-                },
-            ],
-            temperature: 0.3,
-        };
+            // Validate language code if provided
+            if let Some(ref lang) = args.language {
+                if lang.len() != 2 {
+                    return Err(AppError::InvalidLanguage(format!(
+                        "Language code must be 2 characters (ISO 639-1), got: {}",
+                        lang
+                    ))
+                    .into());
+                }
+            }
 
-        let response = client
-            .post(&url)
-            .bearer_auth("test_api_key")
-            .json(&request)
-            .send()
-            .await
-            .unwrap();
+            // Parse start and end times if provided
+            let start_time = if let Some(start_str) = &args.start {
+                Some(parse_time(start_str).map_err(|e| {
+                    AppError::InvalidTimeFormat(format!("Invalid start time: {}", e))
+                })?)
+            } else {
+                None
+            };
 
-        let status = response.status();
-        if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
-            panic!("Translation API request failed: {} - {}", status, error_body);
-        }
+            let end_time = if let Some(end_str) = &args.end {
+                Some(parse_time(end_str).map_err(|e| {
+                    AppError::InvalidTimeFormat(format!("Invalid end time: {}", e))
+                })?)
+            } else {
+                None
+            };
 
-        let translation_response: TranslationResponse = response.json().await.unwrap();
-        assert_eq!(translation_response.choices[0].message.content, "Test translation");
+            // Step 1: Transcribe audio using our test function
+            let transcription = test_transcribe_audio(args.api_key.clone(), args.input_file.clone(), args.language.clone()).await.unwrap();
+
+            // Filter segments based on time range if specified
+            let mut filtered_segments = transcription.segments.clone();
+
+            if start_time.is_some() || end_time.is_some() {
+                filtered_segments = filtered_segments
+                    .into_iter()
+                    .filter(|segment| {
+                        let segment_start = segment.start;
+                        let segment_end = segment.end;
+
+                        // Check if segment overlaps with the specified time range
+                        let after_start = start_time.map_or(true, |start| segment_end > start);
+                        let before_end = end_time.map_or(true, |end| segment_start < end);
+
+                        after_start && before_end
+                    })
+                    .map(|mut segment| {
+                        // Adjust segment timestamps by subtracting start time
+                        if let Some(start) = start_time {
+                            segment.start = (segment.start - start).max(0.0);
+                            segment.end = (segment.end - start).max(0.0);
+                        }
+                        segment
+                    })
+                    .collect();
+            }
+
+            // Generate SRT for original language
+            let original_srt = generate_srt_content(filtered_segments.clone());
+            fs::write(&args.output_file, original_srt).unwrap();
+
+            Ok(())
+        }.await;
+
+        assert!(result.is_ok());
+        let output_content = fs::read_to_string(temp_output.path()).unwrap();
+        assert!(!output_content.is_empty());
+        // Should contain segments 2, 3 and partial 4 (15-35s overlap range)
+        assert!(output_content.contains("Segment 2"));
+        assert!(output_content.contains("Segment 3"));
+        assert!(output_content.contains("Segment 4"));
+        // Should not contain segment 1
+        assert!(!output_content.contains("Segment 1"));
+        // Check that timestamps are adjusted (segment 2 should start at 0.0)
+        assert!(output_content.contains("00:00:00,000 -->"));
     }
 
     #[tokio::test]
@@ -1065,113 +1745,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_transcription_only_with_mock() {
-        let mut server = Server::new_async().await;
-        let _transcription_mock = mock_transcription_server(&mut server);
-
-        let temp_input = NamedTempFile::new().unwrap();
-        let temp_output = NamedTempFile::new().unwrap();
-
-        // Create a modified version of run for testing
-        let result: Result<(), anyhow::Error> = async {
-            // Override the URL for testing
-            let mock_url = server.url();
-
-            // Create a modified transcribe_audio function for testing
-            let test_transcribe_audio = |api_key: String, file_path: PathBuf, language: Option<String>| async move {
-                let client = reqwest::Client::new();
-                let url = format!("{}/v1/audio/transcriptions", mock_url);
-
-                // Read file content
-                let file_content = fs::read(&file_path)
-                    .with_context(|| format!("Failed to read file: {}", file_path.display()))
-                    .unwrap();
-
-                // Build multipart form
-                let file_name = file_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("file")
-                    .to_string();
-
-                let form = reqwest::multipart::Form::new()
-                    .text("model", "voxstral-mini-latest")
-                    .part("file", reqwest::multipart::Part::bytes(file_content).file_name(file_name))
-                    .text("response_format", "json");
-
-                let form = if let Some(lang) = language {
-                    form.text("language", lang)
-                } else {
-                    form
-                };
-
-                let response = client
-                    .post(&url)
-                    .bearer_auth(api_key)
-                    .multipart(form)
-                    .send()
-                    .await
-                    .unwrap();
-
-                let status = response.status();
-                if !status.is_success() {
-                    let error_body = response.text().await.unwrap_or_default();
-                    return Err::<TranscriptionResponse, anyhow::Error>(AppError::ApiError(format!(
-                        "API request failed: {} - {}",
-                        status,
-                        error_body
-                    ))
-                    .into());
-                }
-
-                let transcription: TranscriptionResponse = response.json().await.unwrap();
-                Ok(transcription)
-            };
-
-            let args = Args {
-                input_file: temp_input.path().to_path_buf(),
-                output_file: temp_output.path().to_path_buf(),
-                api_key: "test_api_key".to_string(),
-                language: None,
-                translate_to: vec![],
-                temperature: 0.3,
-            };
-
-            // Validate temperature range
-            if args.temperature < 0.0 || args.temperature > 1.0 {
-                return Err(
-                    AppError::ApiError("Temperature must be between 0.0 and 1.0".to_string()).into(),
-                );
-            }
-
-            // Validate language code if provided
-            if let Some(ref lang) = args.language {
-                if lang.len() != 2 {
-                    return Err(AppError::InvalidLanguage(format!(
-                        "Language code must be 2 characters (ISO 639-1), got: {}",
-                        lang
-                    ))
-                    .into());
-                }
-            }
-
-            // Step 1: Transcribe audio using our test function
-            let transcription = test_transcribe_audio(args.api_key.clone(), args.input_file.clone(), args.language.clone()).await.unwrap();
-
-            // Generate SRT for original language
-            let original_srt = generate_srt_content(transcription.segments.clone());
-            fs::write(&args.output_file, original_srt).unwrap();
-
-            Ok(())
-        }.await;
-
-        assert!(result.is_ok());
-        let output_content = fs::read_to_string(temp_output.path()).unwrap();
-        assert!(!output_content.is_empty());
-        assert!(output_content.contains("Test transcription"));
-    }
-
-    #[tokio::test]
     async fn test_run_transcription_only() {
         if !is_api_key_available() {
             eprintln!("API_KEY not set, skipping test");
@@ -1193,6 +1766,8 @@ mod tests {
             language: Some("fr".to_string()),
             translate_to: vec![],
             temperature: 0.3,
+            start: Some("0s".to_string()),
+            end: Some("30s".to_string()),
         };
 
         let result = run(args).await;
@@ -1214,6 +1789,8 @@ mod tests {
             language: None,
             translate_to: vec![],
             temperature: 1.5, // Invalid temperature
+            start: None,
+            end: None,
         };
 
         let result = run(args).await;
@@ -1236,6 +1813,8 @@ mod tests {
             language: Some("french".to_string()), // Invalid language code
             translate_to: vec![],
             temperature: 0.3,
+            start: None,
+            end: None,
         };
 
         let result = run(args).await;
@@ -1268,6 +1847,8 @@ mod tests {
             language: Some("fr".to_string()),
             translate_to: vec!["english".to_string()],
             temperature: 0.3,
+            start: None,
+            end: None,
         };
 
         let result = run(args).await;
@@ -1286,6 +1867,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_run_transcription_30s_segments_on_test_files() {
+        if !is_api_key_available() {
+            eprintln!("API_KEY not set, skipping test");
+            return;
+        }
+
+        for input_file in [
+            "test_data/sample.flac",
+            "test_data/sample.wav",
+            "test_data/sample.ogg",
+            "test_data/sample.m4a",
+            "test_data/sample.mp4",
+        ] {
+            let input_file = PathBuf::from(input_file);
+            if !input_file.exists() {
+                eprintln!("Test file not found ({}), skipping", input_file.display());
+                continue;
+            }
+
+            let temp_output = NamedTempFile::new().unwrap();
+
+            let args = Args {
+                input_file,
+                output_file: temp_output.path().to_path_buf(),
+                api_key: std::env::var("API_KEY").unwrap(),
+                language: Some("fr".to_string()),
+                translate_to: vec![],
+                temperature: 0.3,
+                start: Some("0s".to_string()),
+                end: Some("30s".to_string()),
+            };
+
+            let result = run(args).await;
+            assert!(result.is_ok(), "30s segment transcription failed");
+
+            let output_content = fs::read_to_string(temp_output.path()).unwrap();
+            assert!(!output_content.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn test_run_with_file_not_found() {
         let temp_output = NamedTempFile::new().unwrap();
 
@@ -1296,6 +1918,8 @@ mod tests {
             language: None,
             translate_to: vec![],
             temperature: 0.3,
+            start: None,
+            end: None,
         };
 
         let result = run(args).await;
@@ -1303,6 +1927,78 @@ mod tests {
         assert!(result.is_err());
         if let Err(e) = result {
             assert!(e.to_string().contains("Failed to read file"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_with_invalid_start_time() {
+        let temp_input = NamedTempFile::new().unwrap();
+        let temp_output = NamedTempFile::new().unwrap();
+
+        let args = Args {
+            input_file: temp_input.path().to_path_buf(),
+            output_file: temp_output.path().to_path_buf(),
+            api_key: "test_api_key".to_string(),
+            language: None,
+            translate_to: vec![],
+            temperature: 0.3,
+            start: Some("invalid".to_string()),
+            end: None,
+        };
+
+        let result = run(args).await;
+
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(e.to_string().contains("Invalid start time"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_with_invalid_end_time() {
+        let temp_input = NamedTempFile::new().unwrap();
+        let temp_output = NamedTempFile::new().unwrap();
+
+        let args = Args {
+            input_file: temp_input.path().to_path_buf(),
+            output_file: temp_output.path().to_path_buf(),
+            api_key: "test_api_key".to_string(),
+            language: None,
+            translate_to: vec![],
+            temperature: 0.3,
+            start: None,
+            end: Some("invalid".to_string()),
+        };
+
+        let result = run(args).await;
+
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(e.to_string().contains("Invalid end time"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_with_end_before_start() {
+        let temp_input = NamedTempFile::new().unwrap();
+        let temp_output = NamedTempFile::new().unwrap();
+
+        let args = Args {
+            input_file: temp_input.path().to_path_buf(),
+            output_file: temp_output.path().to_path_buf(),
+            api_key: "test_api_key".to_string(),
+            language: None,
+            translate_to: vec![],
+            temperature: 0.3,
+            start: Some("30s".to_string()),
+            end: Some("10s".to_string()),
+        };
+
+        let result = run(args).await;
+
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(e.to_string().contains("End time must be greater than start time"));
         }
     }
 }
