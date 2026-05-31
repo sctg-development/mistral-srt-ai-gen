@@ -10,78 +10,139 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-release:
-    name: Build and Release Preview
-    runs-on: ubuntu-latest
-
+  build:
+    name: Build Preview Artifacts
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - platform: windows-msvc-x64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            artifact: mistral-srt-ai-gen-windows-x64.exe
+          - platform: windows-msvc-arm64
+            runner: windows-2022-arm64
+            target: aarch64-pc-windows-msvc
+            artifact: mistral-srt-ai-gen-windows-arm64.exe
+          - platform: ubuntu-x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: mistral-srt-ai-gen-ubuntu-x64
+          - platform: ubuntu-arm64
+            runner: ubuntu-24.04-arm64
+            target: aarch64-unknown-linux-gnu
+            artifact: mistral-srt-ai-gen-ubuntu-arm64
+          - platform: macos-x64
+            runner: macos-14
+            target: x86_64-apple-darwin
+            artifact: mistral-srt-ai-gen-macos-x64
+          - platform: macos-arm64
+            runner: macos-14-arm64
+            target: aarch64-apple-darwin
+            artifact: mistral-srt-ai-gen-macos-arm64
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v6
+      - name: Checkout repository
+        uses: actions/checkout@v6
 
-    - name: Install Rust toolchain
-      run: rustup toolchain install stable
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable
 
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.target }}-
+            ${{ runner.os }}-cargo-
 
-    - name: Cache cargo registry and build output
-      uses: actions/cache@v5
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Check build
+        run: cargo check --verbose --target ${{ matrix.target }}
 
-    - name: Check build
-      run: cargo check --verbose
+      - name: Build project
+        run: cargo build --release --target ${{ matrix.target }}
 
-    - name: Build project
-      run: cargo build --verbose
+      - name: Package artifact
+        run: |
+          mkdir -p release
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/mistral-srt-ai-gen.exe" "release/${{ matrix.artifact }}"
+          else
+            cp "target/${{ matrix.target }}/release/mistral-srt-ai-gen" "release/${{ matrix.artifact }}"
+          fi
+        shell: bash
 
-    - name: Extract version from Cargo.toml
-      id: extract_version
-      run: |
-        VERSION=$(grep '^version' Cargo.toml | cut -d '=' -f 2 | tr -d ' "')
-        echo "Extracted version: $VERSION"
-        echo "version=$VERSION" >> $GITHUB_OUTPUT
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: release/${{ matrix.artifact }}
 
-    - name: Install Tarpaulin for code coverage
-      run: cargo install cargo-tarpaulin
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-24.04
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
 
-    - name: Run tests with coverage
-      run: API_KEY=${{ secrets.API_KEY }}   cargo tarpaulin --out Xml --output-dir .
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable
 
-    - name: Generate preview version
-      id: generate_preview_version
-      run: |
-        TIMESTAMP=$(date +%Y%m%d%H%M%S)
-        BASE_VERSION=${{ steps.extract_version.outputs.version }}
-        PREVIEW_VERSION="${BASE_VERSION}-preview-${TIMESTAMP}"
-        echo "Generated preview version: $PREVIEW_VERSION"
-        echo "preview_version=$PREVIEW_VERSION" >> $GITHUB_OUTPUT
+      - name: Install Tarpaulin for code coverage
+        run: cargo install cargo-tarpaulin
 
-    - name: Build release artifacts
-      run: cargo build --release
+      - name: Run tests with coverage
+        run: API_KEY=${{ secrets.API_KEY }} cargo tarpaulin --out Xml --output-dir .
 
-    - name: Create GitHub Release
-      uses: softprops/action-gh-release@v3
-      if: github.ref == 'refs/heads/main'
-      with:
-        tag_name: ${{ steps.generate_preview_version.outputs.preview_version }}
-        name: Preview Release ${{ steps.generate_preview_version.outputs.preview_version }}
-        body: |
-          Automatic preview release generated from commit ${{ github.sha }}
-          Base version: ${{ steps.extract_version.outputs.version }}
-        draft: false
-        prerelease: true
-        files: |
-            target/release/mistral-srt-ai-gen
-        
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v5
-      with:
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
           files: ./rust/cobertura.xml
           slug: sctg-development/mistral-srt-ai-gen
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  release:
+    name: Create GitHub Release
+    needs: [build, coverage]
+    runs-on: ubuntu-24.04
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Extract version from Cargo.toml
+        id: extract_version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | cut -d '=' -f 2 | tr -d ' "')
+          echo "Extracted version: $VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Generate preview version
+        id: generate_preview_version
+        run: |
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          BASE_VERSION=${{ steps.extract_version.outputs.version }}
+          PREVIEW_VERSION="${BASE_VERSION}-preview-${TIMESTAMP}"
+          echo "Generated preview version: $PREVIEW_VERSION"
+          echo "preview_version=$PREVIEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.generate_preview_version.outputs.preview_version }}
+          name: Preview Release ${{ steps.generate_preview_version.outputs.preview_version }}
+          body: |
+            Automatic preview release generated from commit ${{ github.sha }}
+            Base version: ${{ steps.extract_version.outputs.version }}
+          draft: false
+          prerelease: true
+          files: release-artifacts/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
