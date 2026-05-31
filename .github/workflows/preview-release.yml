@@ -16,16 +16,16 @@ jobs:
     strategy:
       matrix:
         include:
-          - platform: windows-msvc-x64
-            runner: windows-2022
-            target: x86_64-pc-windows-msvc
-            ffmpeg_archive: ffmpeg-master-latest-win64-gpl-shared.zip
-            artifact: mistral-srt-ai-gen-windows-x64.exe
-          - platform: windows-msvc-arm64
-            runner: windows-2022-arm64
-            target: aarch64-pc-windows-msvc
-            ffmpeg_archive: ffmpeg-master-latest-winarm64-gpl-shared.zip
-            artifact: mistral-srt-ai-gen-windows-arm64.exe
+        #   - platform: windows-msvc-x64
+        #     runner: windows-2022
+        #     target: x86_64-pc-windows-msvc
+        #     ffmpeg_archive: ffmpeg-master-latest-win64-gpl-shared.zip
+        #     artifact: mistral-srt-ai-gen-windows-x64.exe
+        #   - platform: windows-msvc-arm64
+        #     runner: windows-2022-arm64
+        #     target: aarch64-pc-windows-msvc
+        #     ffmpeg_archive: ffmpeg-master-latest-winarm64-gpl-shared.zip
+        #     artifact: mistral-srt-ai-gen-windows-arm64.exe
           - platform: ubuntu-x64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu

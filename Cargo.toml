@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "A tool to generate SRT files from audio/video files using Mistral AI services"
 license = "MIT"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["Ronan Le Meillat"]
 
 [dependencies]
 clap = { version = "4.0", features = ["derive"] }
