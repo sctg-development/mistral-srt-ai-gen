@@ -186,25 +186,25 @@ jobs:
         with:
           path: release-artifacts
 
-       - name: Extract version from Cargo.toml
-         id: extract_version
-         run: |
-           VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d '=' -f 2 | tr -d ' "')
-           if [ -z "$VERSION" ]; then
-             echo "Error: Could not extract version from Cargo.toml"
-             exit 1
-           fi
-           echo "Extracted version: $VERSION"
-           echo "version=$VERSION" >> $GITHUB_OUTPUT
+      - name: Extract version from Cargo.toml
+        id: extract_version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d '=' -f 2 | tr -d ' "')
+          if [ -z "$VERSION" ]; then
+            echo "Error: Could not extract version from Cargo.toml"
+            exit 1
+          fi
+          echo "Extracted version: $VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-       - name: Generate preview version
-         id: generate_preview_version
-         run: |
-           TIMESTAMP=$(date +%Y%m%d%H%M%S)
-           BASE_VERSION=${{ steps.extract_version.outputs.version }}
-           PREVIEW_VERSION="v${BASE_VERSION}-preview.${TIMESTAMP}"
-           echo "Generated preview version: $PREVIEW_VERSION"
-           echo "preview_version=$PREVIEW_VERSION" >> $GITHUB_OUTPUT
+      - name: Generate preview version
+        id: generate_preview_version
+        run: |
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          BASE_VERSION=${{ steps.extract_version.outputs.version }}
+          PREVIEW_VERSION="v${BASE_VERSION}-preview.${TIMESTAMP}"
+          echo "Generated preview version: $PREVIEW_VERSION"
+          echo "preview_version=$PREVIEW_VERSION" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
